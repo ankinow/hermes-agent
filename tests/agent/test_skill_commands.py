@@ -686,6 +686,148 @@ class TestTemplateVarSubstitution:
         assert "${HERMES_SKILL_DIR}/scripts/foo.js" in msg
 
 
+class TestLiveContextFooter:
+    """Per-turn live context resolves into a footer AFTER the cache boundary.
+
+    The invariant these protect: the bytes the cache planner breaks on are
+    identical with and without the footer, and no provider can break a load.
+    """
+
+    @staticmethod
+    def _fake_providers(values, failing=None):
+        """Provider table stand-in: *values* resolve, *failing* raises."""
+        from agent import skill_live_context
+
+        skill_live_context.clear_live_context_cache()
+        table = {name: (lambda ctx, v=v: v) for name, v in values.items()}
+        if failing:
+            def _boom(ctx):
+                raise RuntimeError("provider exploded")
+            table[failing] = _boom
+        return table
+
+    @staticmethod
+    def _build(tmp_path, name="live-ctx", instruction="", providers=None, cfg=None):
+        """Build a skill message with *providers* patched in; returns the message."""
+        from agent import skill_live_context
+
+        skills_cfg = {"template_vars": True, "live_context": True}
+        skills_cfg.update(cfg or {})
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("agent.skill_commands._load_skills_config", return_value=skills_cfg),
+            patch.dict(skill_live_context.LIVE_CONTEXT_PROVIDERS, providers or {}, clear=True),
+        ):
+            _make_skill(tmp_path, name, body="Do the thing.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(f"/{name}", instruction)
+        skill_live_context.clear_live_context_cache()
+        return msg
+
+    def test_resolved_value_appears_in_footer(self, tmp_path):
+        from agent.skill_live_context import LIVE_CONTEXT_HEADER
+
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "shipped the footer"},
+        ))
+        assert msg is not None
+        assert LIVE_CONTEXT_HEADER in msg
+        assert "HERMES_DIARY_TODAY: shipped the footer" in msg
+
+    def test_body_never_carries_live_values(self, tmp_path):
+        """The cache-breaking prefix is byte-identical with and without the footer."""
+        from agent import skill_live_context
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+        skill_live_context.clear_live_context_cache()
+        providers = self._fake_providers({"HERMES_GIT_STATUS": "7 uncommitted path(s)"})
+        rendered = {}
+        for enabled in (False, True):
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+                patch("agent.skill_commands._load_skills_config",
+                      return_value={"template_vars": True, "live_context": enabled}),
+                patch.dict(skill_live_context.LIVE_CONTEXT_PROVIDERS, providers, clear=True),
+            ):
+                _make_skill(tmp_path, "stable", body="Do the thing.")
+                scan_skill_commands()
+                loaded = _load_skill_payload("stable")
+                rendered[enabled] = _build_skill_message(
+                    loaded[0], loaded[1],
+                    '[IMPORTANT: The user has invoked the "stable" skill.]',
+                    user_instruction="do it", session_id="s1",
+                )
+        skill_live_context.clear_live_context_cache()
+
+        # The instruction marker — the exact byte the cache planner breaks on —
+        # must be at the same offset with and without live context.
+        marker = "The user has provided the following instruction alongside the skill invocation: "
+        assert rendered[False].index(marker) == rendered[True].index(marker)
+        assert rendered[True].startswith(rendered[False][:rendered[False].index(marker) + len(marker)] + "do it")
+        assert "7 uncommitted path(s)" in rendered[True]
+
+    def test_failing_provider_omits_block_and_still_loads(self, tmp_path):
+        """Fail-open: one broken provider drops the whole footer, never the skill."""
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "some context"}, failing="HERMES_GIT_STATUS",
+        ))
+        assert msg is not None
+        assert "Do the thing." in msg
+        assert "some context" not in msg
+
+    def test_footer_respects_size_cap(self, tmp_path):
+        """A provider returning far past the budget still yields a capped block."""
+        from agent.skill_live_context import (
+            LIVE_CONTEXT_MAX_CHARS, LIVE_CONTEXT_PROVIDERS, clear_live_context_cache, render_live_context_block,
+        )
+
+        huge = "abcdefghij" * 20_000
+        block = render_live_context_block({"HERMES_DIARY_TODAY": huge})
+        assert len(block) <= LIVE_CONTEXT_MAX_CHARS
+        assert "abcdefghij" * 500 not in block  # the bulk is elided, not passed through
+
+    def test_per_provider_cap_applies_before_rendering(self, tmp_path):
+        """``resolve_live_context`` caps each value, so no single provider can dominate."""
+        from agent.skill_live_context import (
+            LIVE_CONTEXT_PROVIDERS, MAX_CHARS_PER_PROVIDER, clear_live_context_cache, resolve_live_context,
+        )
+
+        providers = {"HERMES_DIARY_TODAY": lambda ctx: "y" * 100_000}
+        with patch.dict(LIVE_CONTEXT_PROVIDERS, providers, clear=True):
+            clear_live_context_cache()
+            values = resolve_live_context(
+                providers=list(providers),
+                session_ctx={"cwd": None, "hermes_home": None, "session_id": None, "today": "2026-01-01"},
+            )
+        clear_live_context_cache()
+        cap = MAX_CHARS_PER_PROVIDER["HERMES_DIARY_TODAY"]
+        assert len(values["HERMES_DIARY_TODAY"]) <= cap
+
+    def test_disabled_by_config(self, tmp_path):
+        from agent.skill_live_context import LIVE_CONTEXT_HEADER
+
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "should not appear"},
+        ), cfg={"live_context": False})
+        assert msg is not None
+        assert LIVE_CONTEXT_HEADER not in msg
+        assert "should not appear" not in msg
+
+    def test_footer_is_not_recovered_as_user_instruction(self, tmp_path):
+        """The footer is scaffolding: it must not reach memory rows or titles."""
+        from agent.skill_commands import describe_skill_invocation, extract_user_instruction_from_skill_message
+
+        msg = self._build(tmp_path, instruction="fix the title leak", providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "SCAFFOLD_TEXT_SHOULD_NOT_LEAK"},
+        ))
+        assert msg is not None
+        assert extract_user_instruction_from_skill_message(msg) == "fix the title leak"
+        described = describe_skill_invocation(msg)
+        assert described is not None
+        assert "SCAFFOLD_TEXT_SHOULD_NOT_LEAK" not in described
+        assert "fix the title leak" in described
+
+
 class TestInlineShellExpansion:
     """Inline ``!`cmd`` snippets in SKILL.md run before the agent sees the
     content — but only when the user has opted in via config."""

@@ -12,6 +12,7 @@ from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
+from agent.skill_live_context import LIVE_CONTEXT_HEADER, strip_live_context
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
 
@@ -55,8 +56,7 @@ def escape_like(text: str) -> str:
     ``_`` is common in branch names/titles/paths and a substring match must not silently widen."""
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-
-_PREVIEW_CONTENT_SQL = "REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' ')"
+# Session-preview content expression is defined below, next to ``_sql_literal``.
 # User-invoked and gateway auto-load scaffolds both get the head+tail excerpt window:
 # the typed request sits at the tail (auto-load) or behind the instruction marker.
 # No LIKE wildcards in either prefix, so no ESCAPE clause is needed.
@@ -68,6 +68,17 @@ _SQL_WHITESPACE = "CHAR(9) || CHAR(10) || CHAR(13) || CHAR(32)"
 
 def _sql_literal(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
+
+
+# A scaffolded row ends with the per-turn live-context footer. It is scaffolding,
+# not the user's words, and it sits at the very END of the message — so leaving
+# it in pushes the typed instruction out of the fixed tail window and the row
+# previews as a bare "/work". Cut the content at the footer BEFORE windowing,
+# exactly as ``_shape_preview`` strips it before describing.
+_PREVIEW_CONTENT_SQL = (
+    f"REPLACE(REPLACE(CASE WHEN INSTR(m.content, {_sql_literal(LIVE_CONTEXT_HEADER)}) > 0"
+    f" THEN SUBSTR(m.content, 1, INSTR(m.content, {_sql_literal(LIVE_CONTEXT_HEADER)}) - 1)"
+    f" ELSE m.content END, X'0A', ' '), X'0D', ' ')")
 
 
 # ``display_metadata`` flag stamped on the user row a busy-queue accept writes (#111868/#121374
@@ -150,6 +161,11 @@ def _shape_preview(raw: Any) -> str:
     if not text:
         return ""
     text = text.replace("\n", " ").replace("\r", " ")
+    # A scaffolded row's live-context footer is per-turn scaffolding, not the
+    # user's words. It also sits at the very end of the message, so leaving it
+    # in evicts the typed instruction from the fixed tail window and the row
+    # previews as a bare "/work". Strip before describing.
+    text = strip_live_context(text)
     described = describe_skill_invocation(text)
     text = described if described is not None else text.split(SKILL_EXCERPT_JOINT)[0]
     return text[:_PREVIEW_MAX_CHARS] + "..." if len(text) > _PREVIEW_MAX_CHARS else text

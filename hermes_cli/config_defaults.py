@@ -1470,6 +1470,12 @@ DEFAULT_CONFIG = {
         # skill-author content would run on the host unapproved — trusted sources only.
         "inline_shell": False,
         "inline_shell_timeout": 10,  # seconds per !`cmd` snippet
+        # Append a per-turn "[Live context]" footer to every loaded skill (today's
+        # diary, backlog head, uncommitted-path count, last user intent) so a bare
+        # "/skill <name>" still carries the task. Resolved AFTER the prompt-cache
+        # boundary, so the static prefix stays byte-stable; every provider is
+        # capped and fails open. Set false to keep skill messages byte-identical.
+        "live_context": True,
         # Security-scan skills the agent writes via skill_manage. Off: the agent can run the same
         # code via terminal() ungated, so it mostly blocks prose with risky keywords. On: a
         # dangerous verdict is a tool error the agent can retry. Hub installs are always scanned.

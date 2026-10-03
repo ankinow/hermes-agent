@@ -105,6 +105,13 @@ def extract_user_instruction_from_skill_message(content: Any) -> Optional[str]:
         return None
     if not content.startswith(_SKILL_INVOCATION_PREFIX):
         return content
+    # Live context resolves into a per-turn footer after the instruction. It is
+    # scaffolding, not user text: strip it before recovery so it never reaches
+    # memory rows, session titles or previews (a bare invocation has no runtime
+    # note to cut on, so the footer would otherwise ride along whole).
+    from agent.skill_live_context import strip_live_context
+
+    content = strip_live_context(content)
     if _BUNDLE_MARKER in content:
         # Bundles put the instruction before the loaded skills: FIRST marker is the user's.
         return _cut_after(content, _BUNDLE_USER_INSTRUCTION, _BUNDLE_FIRST_SKILL_BLOCK, content.find)
@@ -129,6 +136,13 @@ def _describe_auto_loaded_skill_turn(content: str) -> Optional[str]:
         return None
     name_match = re.match(re.escape(_AUTO_LOAD_PREFIX) + r'([^"]*)"', content)
     name = name_match.group(1) if name_match else ""
+    # The live-context footer is scaffolding, not something the user typed.
+    # Strip it FIRST, then locate the payload footer in the stripped string —
+    # measuring the offset before stripping shifts every later index and makes
+    # the slice start mid-word.
+    from agent.skill_live_context import strip_live_context
+
+    content = strip_live_context(content)
     # The payload footer ends with this exact sentence (_build_skill_message); the
     # user's text is the last thing after the FINAL footer in the message.
     footer_end = content.rfind(_SKILL_DIR_NOTE_END)
@@ -295,6 +309,18 @@ def _supporting_files(loaded_skill: dict[str, Any], skill_dir: Path | None) -> l
     return supporting
 
 
+def _live_context_footer(session_id: str | None) -> str:
+    """The per-turn live-context footer, or ``""``. Never raises: a skill load
+    must render even when every provider fails (see agent/skill_live_context.py)."""
+    try:
+        from agent.skill_live_context import build_live_context_footer, live_context_session_ctx
+
+        return build_live_context_footer(live_context_session_ctx(session_id))
+    except Exception:
+        logger.debug("Live context footer unavailable", exc_info=True)
+        return ""
+
+
 def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
@@ -305,9 +331,10 @@ def _build_skill_message(
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
     from tools.skills_tool import _skills_dir
+    skills_cfg = _load_skills_config()
     # Preprocess first so downstream blocks see the expanded content.
     content = preprocess_skill_content(
-        str(loaded_skill.get("content") or ""), skill_dir, session_id, skills_cfg=_load_skills_config(),
+        str(loaded_skill.get("content") or ""), skill_dir, session_id, skills_cfg=skills_cfg,
     )
     parts = [activation_note, "", content.strip()]
     # Absolute skill dir lets the agent run bundled scripts without a skill_view() round-trip.
@@ -342,6 +369,14 @@ def _build_skill_message(
         stable_prefix = append_user_instruction(parts, user_instruction)
     if runtime_note:
         parts += ["", f"[Runtime note: {runtime_note}]"]
+    # Live context resolves AFTER the cache boundary on purpose: everything
+    # above is byte-stable per skill, this footer is per-turn. Interpolating it
+    # into the body instead would invalidate the static prompt-cache prefix on
+    # every turn (see agent/skill_live_context.py).
+    if skills_cfg.get("live_context", True):
+        footer = _live_context_footer(session_id)
+        if footer:
+            parts += ["", footer]
     message = "\n".join(parts)
     if stable_prefix is not None and message.startswith(stable_prefix) and len(message) > len(stable_prefix):
         register_stable_prefix(stable_prefix)

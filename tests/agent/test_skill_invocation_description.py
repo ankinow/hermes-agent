@@ -91,7 +91,13 @@ class TestExcerptedScaffolding:
     """Preview queries hand over a head+tail excerpt, not the whole message."""
 
     def _excerpt(self, message, window=400):
-        """Mirror what _preview_raw_select() hands to _shape_preview()."""
+        """Mirror what _preview_raw_select() hands to _shape_preview(): the content is
+        cut at the live-context footer BEFORE the head/tail window is taken."""
+        from agent.skill_live_context import LIVE_CONTEXT_HEADER
+
+        cut = message.find(LIVE_CONTEXT_HEADER)
+        if cut >= 0:
+            message = message[:cut]
         flat = message.replace("\n", " ").replace("\r", " ")
         if len(message) <= window * 2:
             return flat[: window * 2]

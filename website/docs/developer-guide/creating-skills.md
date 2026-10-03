@@ -320,6 +320,25 @@ skills:
 
 Snippets run with the skill directory as their working directory, and output is capped at 4000 characters. Failures (timeouts, non-zero exits) show up as a short `[inline-shell error: ...]` marker instead of breaking the whole skill.
 
+#### Live context (automatic task context)
+
+`/skill <name>` with no typed instruction still appends a `[Live context]` footer so the agent
+knows what the task is without the user restating it. Four providers fill it:
+
+| Provider | Value |
+|---|---|
+| `HERMES_DIARY_TODAY` | Today's `$HERMES_HOME/diary/<YYYY-MM-DD>.md` — heading plus its tail |
+| `HERMES_BACKLOG_HEAD` | The opening items of `BACKLOG.md` (project root, then `$HERMES_HOME`) |
+| `HERMES_GIT_STATUS` | Count of uncommitted paths plus the first 5 — **never the diff** |
+| `HERMES_LAST_USER_INTENT` | The newest user turn of this session, truncated |
+
+The footer resolves **after** the prompt-cache boundary, so the static prefix the cache planner
+breaks on is byte-identical with and without it — a skill load cannot invalidate the cache
+(see [#81867](https://github.com/NousResearch/hermes-agent/pull/81867)). It is capped twice: per
+provider and at 1200 characters for the whole block. Every provider is read through
+`try`/`except`; one that raises omits the entire block rather than half-filling it, and the skill
+still loads. Turn it off with `skills.live_context: false` to keep skill messages byte-identical.
+
 ### Test It
 
 Run the skill and verify the agent follows the instructions correctly:
