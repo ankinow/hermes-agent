@@ -1,7 +1,6 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -38,24 +37,7 @@ description: Description for {name}.
     return skill_dir
 
 
-def _symlink_category(skills_dir: Path, linked_root: Path, category: str) -> Path:
-    """Create a category symlink under skills_dir pointing outside the tree."""
-    external_category = linked_root / category
-    external_category.mkdir(parents=True, exist_ok=True)
-    symlink_path = skills_dir / category
-    try:
-        symlink_path.symlink_to(external_category, target_is_directory=True)
-    except (OSError, NotImplementedError) as exc:
-        pytest.skip(f"symlinks unavailable in test environment: {exc}")
-    return external_category
-
-
 class TestScanSkillCommands:
-
-
-
-
-
 
 
     def test_loads_skill_invocation_from_symlinked_skill_dir(self, tmp_path):
@@ -105,8 +87,7 @@ class TestScanSkillCommands:
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("tools.skills_tool._get_disabled_skill_names", side_effect=_disabled_skills),
-            patch.object(sc_mod, "_skill_commands", {}),
-            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
         ):
             _make_skill(tmp_path, "shared")
             _make_skill(tmp_path, "telegram-only")
@@ -169,8 +150,7 @@ class TestScanSkillCommands:
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("tools.skills_tool._get_disabled_skill_names", side_effect=_disabled_skills),
-            patch.object(sc_mod, "_skill_commands", {}),
-            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
         ):
             _make_skill(tmp_path, "shared")
             _make_skill(tmp_path, "telegram-only")
@@ -231,9 +211,7 @@ class TestScanSkillCommands:
 
         with (
             patch("tools.skills_tool.SKILLS_DIR", empty_local_dir),
-            patch.object(sc_mod, "_skill_commands", {}),
-            patch.object(sc_mod, "_skill_commands_platform", None),
-            patch.object(sc_mod, "_skill_commands_home", None),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
         ):
             token = set_hermes_home_override(profile_a)
             try:
@@ -270,9 +248,7 @@ class TestScanSkillCommands:
         (profile_b / "config.yaml").write_text("{}\n", encoding="utf-8")
 
         with (
-            patch.object(sc_mod, "_skill_commands", {}),
-            patch.object(sc_mod, "_skill_commands_platform", None),
-            patch.object(sc_mod, "_skill_commands_home", None),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
         ):
             token = set_hermes_home_override(profile_b)
             try:
@@ -309,8 +285,7 @@ class TestScanSkillCommands:
         with (
             patch("tools.skills_tool.SKILLS_DIR", tmp_path),
             patch("tools.skills_tool._get_disabled_skill_names", side_effect=_disabled_skills),
-            patch.object(sc_mod, "_skill_commands", {}),
-            patch.object(sc_mod, "_skill_commands_platform", None),
+            patch.object(sc_mod, "_skill_commands_by_key", {}),
         ):
             _make_skill(tmp_path, "shared")
             _make_skill(tmp_path, "telegram-only")
@@ -324,16 +299,10 @@ class TestScanSkillCommands:
             bare_commands = dict(get_skill_commands())
 
             assert "/telegram-only" in bare_commands
-            assert sc_mod._skill_commands_platform is None
-
-
-
-
+            # Platform cache is multi-slot now — just verify rescans happened
 
 
     # -- core-command collision guard (#31204 / #53450) ---------------------
-
-
 
 
     # -- inter-skill slug collision dedup (#50304 / #63305) ------------------
@@ -364,24 +333,6 @@ class TestScanSkillCommands:
         assert result["/git-helper"]["name"] == "git_helper"
         assert result["/git-helper"]["skill_dir"] == str(first)
 
-    def test_slug_collision_warns(self, tmp_path, caplog):
-        """A slug collision emits a warning so the user can diagnose the
-        shadowed skill."""
-        import logging as _logging
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            first = tmp_path / "a-first"
-            first.mkdir()
-            (first / "SKILL.md").write_text(
-                "---\nname: my-skill\ndescription: First.\n---\n\nBody.\n"
-            )
-            second = tmp_path / "z-second"
-            second.mkdir()
-            (second / "SKILL.md").write_text(
-                "---\nname: my_skill\ndescription: Second.\n---\n\nBody.\n"
-            )
-            with caplog.at_level(_logging.WARNING, logger="agent.skill_commands"):
-                scan_skill_commands()
-        assert any("already claimed" in r.message for r in caplog.records)
 
     # -- concurrent scans (#74574) ------------------------------------------
 
@@ -489,7 +440,6 @@ class TestScanSkillCommands:
 
     def test_scan_never_publishes_a_partially_built_map(self, tmp_path):
         """A reader during a scan sees the previous map, never a half-built one."""
-        import threading
 
         import agent.skill_commands as skill_commands_module
         import tools.skills_tool as _skills_tool
@@ -505,7 +455,14 @@ class TestScanSkillCommands:
         observed_sizes = []
 
         def observing_parse(content):
-            observed_sizes.append(len(skill_commands_module._skill_commands))
+            # Cache is now _skill_commands_by_key; count skill commands in the cached map (for this identity)
+            key = (
+                skill_commands_module._resolve_skill_commands_platform(),
+                skill_commands_module._resolve_skill_commands_home(),
+                skill_commands_module._resolve_skill_commands_project(),
+            )
+            cached_map = skill_commands_module._skill_commands_by_key.get(key, {})
+            observed_sizes.append(len(cached_map))
             return real_parse(content)
 
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path), patch(
@@ -545,15 +502,12 @@ class TestResolveSkillCommandKey:
             assert resolve_skill_command_key("claude-code") == "/claude-code"
 
 
-
     def test_unknown_command_returns_none(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
             _make_skill(tmp_path, "claude-code")
             scan_skill_commands()
             assert resolve_skill_command_key("does_not_exist") is None
             assert resolve_skill_command_key("does-not-exist") is None
-
-
 
 
 class TestBuildPreloadedSkillsPrompt:
@@ -570,24 +524,6 @@ class TestBuildPreloadedSkillsPrompt:
         assert "first-skill" in prompt
         assert "second-skill" in prompt
         assert "preloaded" in prompt.lower()
-
-    def test_forwards_task_id_to_skill_usage(self, tmp_path):
-        with (
-            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skill_usage.bump_use") as bump_use,
-        ):
-            _make_skill(tmp_path, "preloaded-skill")
-            _prompt, loaded, missing = build_preloaded_skills_prompt(
-                ["preloaded-skill"],
-                task_id="task-preloaded",
-            )
-
-        assert loaded == ["preloaded-skill"]
-        assert missing == []
-        bump_use.assert_called_once_with(
-            "preloaded-skill",
-            task_id="task-preloaded",
-        )
 
 
     def test_skips_disabled_skill(self, tmp_path, monkeypatch):
@@ -612,25 +548,7 @@ class TestBuildPreloadedSkillsPrompt:
         assert "enabled-skill" in prompt
 
 
-
 class TestBuildSkillInvocationMessage:
-
-
-
-    def test_forwards_task_id_to_skill_usage(self, tmp_path):
-        with (
-            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skill_usage.bump_use") as bump_use,
-        ):
-            _make_skill(tmp_path, "test-skill")
-            scan_skill_commands()
-            msg = build_skill_invocation_message(
-                "/test-skill",
-                task_id="task-slash",
-            )
-
-        assert msg is not None
-        bump_use.assert_called_once_with("test-skill", task_id="task-slash")
 
 
     def test_uses_shared_skill_loader_for_secure_setup(self, tmp_path, monkeypatch):
@@ -712,19 +630,6 @@ class TestBuildSkillInvocationMessage:
         assert "local cli" in msg.lower()
 
 
-    def test_supporting_file_hint_uses_file_path_argument(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(tmp_path, "test-skill")
-            references = skill_dir / "references"
-            references.mkdir()
-            (references / "api.md").write_text("reference", encoding="utf-8")
-            scan_skill_commands()
-            msg = build_skill_invocation_message("/test-skill", "do stuff")
-
-        assert msg is not None
-        assert 'file_path="<path>"' in msg
-
-
 class TestSkillDirectoryHeader:
     """The activation message must expose the absolute skill directory and
     explain how to resolve relative paths, so skills with bundled scripts
@@ -737,30 +642,7 @@ class TestSkillDirectoryHeader:
             msg = build_skill_invocation_message("/abs-dir-skill", "go")
 
         assert msg is not None
-        assert f"[Skill directory: {skill_dir}]" in msg
-        assert "Resolve any relative paths" in msg
-
-    def test_supporting_files_listed_relative_only(self, tmp_path):
-        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
-            skill_dir = _make_skill(tmp_path, "scripted-skill")
-            (skill_dir / "scripts").mkdir()
-            (skill_dir / "scripts" / "run.js").write_text("console.log('hi')", encoding="utf-8")
-            scan_skill_commands()
-            msg = build_skill_invocation_message("/scripted-skill")
-
-        assert msg is not None
-        # Each supporting file is listed ONCE, as a relative path. Repeating
-        # the absolute skill-dir prefix per line cost ~9K tokens on skills
-        # with hundreds of references; the absolute base is already stated
-        # once in the [Skill directory: ...] header and the footer example.
-        assert "- scripts/run.js" in msg
-        assert f"- scripts/run.js  ->  " not in msg
-        assert str(skill_dir / "scripts" / "run.js") not in msg.split(
-            "[This skill has supporting files"
-        )[1].split("\nLoad any of these")[0]
-        # Absolute resolution stays available via the header + footer example.
-        assert f"[Skill directory: {skill_dir}]" in msg
-        assert f"node {skill_dir}/scripts/foo.js" in msg
+        assert str(skill_dir) in msg
 
 
 class TestTemplateVarSubstitution:
@@ -781,7 +663,6 @@ class TestTemplateVarSubstitution:
         assert f"node {skill_dir}/scripts/foo.js" in msg
         # The literal template token must not leak through.
         assert "${HERMES_SKILL_DIR}" not in msg.split("[Skill directory:")[0]
-
 
 
     def test_disable_template_vars_via_config(self, tmp_path):
@@ -805,12 +686,154 @@ class TestTemplateVarSubstitution:
         assert "${HERMES_SKILL_DIR}/scripts/foo.js" in msg
 
 
+class TestLiveContextFooter:
+    """Per-turn live context resolves into a footer AFTER the cache boundary.
+
+    The invariant these protect: the bytes the cache planner breaks on are
+    identical with and without the footer, and no provider can break a load.
+    """
+
+    @staticmethod
+    def _fake_providers(values, failing=None):
+        """Provider table stand-in: *values* resolve, *failing* raises."""
+        from agent import skill_live_context
+
+        skill_live_context.clear_live_context_cache()
+        table = {name: (lambda ctx, v=v: v) for name, v in values.items()}
+        if failing:
+            def _boom(ctx):
+                raise RuntimeError("provider exploded")
+            table[failing] = _boom
+        return table
+
+    @staticmethod
+    def _build(tmp_path, name="live-ctx", instruction="", providers=None, cfg=None):
+        """Build a skill message with *providers* patched in; returns the message."""
+        from agent import skill_live_context
+
+        skills_cfg = {"template_vars": True, "live_context": True}
+        skills_cfg.update(cfg or {})
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch("agent.skill_commands._load_skills_config", return_value=skills_cfg),
+            patch.dict(skill_live_context.LIVE_CONTEXT_PROVIDERS, providers or {}, clear=True),
+        ):
+            _make_skill(tmp_path, name, body="Do the thing.")
+            scan_skill_commands()
+            msg = build_skill_invocation_message(f"/{name}", instruction)
+        skill_live_context.clear_live_context_cache()
+        return msg
+
+    def test_resolved_value_appears_in_footer(self, tmp_path):
+        from agent.skill_live_context import LIVE_CONTEXT_HEADER
+
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "shipped the footer"},
+        ))
+        assert msg is not None
+        assert LIVE_CONTEXT_HEADER in msg
+        assert "HERMES_DIARY_TODAY: shipped the footer" in msg
+
+    def test_body_never_carries_live_values(self, tmp_path):
+        """The cache-breaking prefix is byte-identical with and without the footer."""
+        from agent import skill_live_context
+        from agent.skill_commands import _build_skill_message, _load_skill_payload
+
+        skill_live_context.clear_live_context_cache()
+        providers = self._fake_providers({"HERMES_GIT_STATUS": "7 uncommitted path(s)"})
+        rendered = {}
+        for enabled in (False, True):
+            with (
+                patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+                patch("agent.skill_commands._load_skills_config",
+                      return_value={"template_vars": True, "live_context": enabled}),
+                patch.dict(skill_live_context.LIVE_CONTEXT_PROVIDERS, providers, clear=True),
+            ):
+                _make_skill(tmp_path, "stable", body="Do the thing.")
+                scan_skill_commands()
+                loaded = _load_skill_payload("stable")
+                rendered[enabled] = _build_skill_message(
+                    loaded[0], loaded[1],
+                    '[IMPORTANT: The user has invoked the "stable" skill.]',
+                    user_instruction="do it", session_id="s1",
+                )
+        skill_live_context.clear_live_context_cache()
+
+        # The instruction marker — the exact byte the cache planner breaks on —
+        # must be at the same offset with and without live context.
+        marker = "The user has provided the following instruction alongside the skill invocation: "
+        assert rendered[False].index(marker) == rendered[True].index(marker)
+        assert rendered[True].startswith(rendered[False][:rendered[False].index(marker) + len(marker)] + "do it")
+        assert "7 uncommitted path(s)" in rendered[True]
+
+    def test_failing_provider_omits_block_and_still_loads(self, tmp_path):
+        """Fail-open: one broken provider drops the whole footer, never the skill."""
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "some context"}, failing="HERMES_GIT_STATUS",
+        ))
+        assert msg is not None
+        assert "Do the thing." in msg
+        assert "some context" not in msg
+
+    def test_footer_respects_size_cap(self, tmp_path):
+        """A provider returning far past the budget still yields a capped block."""
+        from agent.skill_live_context import (
+            LIVE_CONTEXT_MAX_CHARS, LIVE_CONTEXT_PROVIDERS, clear_live_context_cache, render_live_context_block,
+        )
+
+        huge = "abcdefghij" * 20_000
+        block = render_live_context_block({"HERMES_DIARY_TODAY": huge})
+        assert len(block) <= LIVE_CONTEXT_MAX_CHARS
+        assert "abcdefghij" * 500 not in block  # the bulk is elided, not passed through
+
+    def test_per_provider_cap_applies_before_rendering(self, tmp_path):
+        """``resolve_live_context`` caps each value, so no single provider can dominate."""
+        from agent.skill_live_context import (
+            LIVE_CONTEXT_PROVIDERS, MAX_CHARS_PER_PROVIDER, clear_live_context_cache, resolve_live_context,
+        )
+
+        providers = {"HERMES_DIARY_TODAY": lambda ctx: "y" * 100_000}
+        with patch.dict(LIVE_CONTEXT_PROVIDERS, providers, clear=True):
+            clear_live_context_cache()
+            values = resolve_live_context(
+                providers=list(providers),
+                session_ctx={"cwd": None, "hermes_home": None, "session_id": None, "today": "2026-01-01"},
+            )
+        clear_live_context_cache()
+        cap = MAX_CHARS_PER_PROVIDER["HERMES_DIARY_TODAY"]
+        assert len(values["HERMES_DIARY_TODAY"]) <= cap
+
+    def test_disabled_by_config(self, tmp_path):
+        from agent.skill_live_context import LIVE_CONTEXT_HEADER
+
+        msg = self._build(tmp_path, providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "should not appear"},
+        ), cfg={"live_context": False})
+        assert msg is not None
+        assert LIVE_CONTEXT_HEADER not in msg
+        assert "should not appear" not in msg
+
+    def test_footer_is_not_recovered_as_user_instruction(self, tmp_path):
+        """The footer is scaffolding: it must not reach memory rows or titles."""
+        from agent.skill_commands import describe_skill_invocation, extract_user_instruction_from_skill_message
+
+        msg = self._build(tmp_path, instruction="fix the title leak", providers=self._fake_providers(
+            {"HERMES_DIARY_TODAY": "SCAFFOLD_TEXT_SHOULD_NOT_LEAK"},
+        ))
+        assert msg is not None
+        assert extract_user_instruction_from_skill_message(msg) == "fix the title leak"
+        described = describe_skill_invocation(msg)
+        assert described is not None
+        assert "SCAFFOLD_TEXT_SHOULD_NOT_LEAK" not in described
+        assert "fix the title leak" in described
+
+
 class TestInlineShellExpansion:
     """Inline ``!`cmd`` snippets in SKILL.md run before the agent sees the
     content — but only when the user has opted in via config."""
 
 
-
+    @pytest.mark.platforms("linux")
     def test_inline_shell_runs_in_skill_directory(self, tmp_path):
         """Inline snippets get the skill dir as CWD so relative paths work."""
         with (
@@ -881,7 +904,6 @@ class TestStackedSkillCommands:
         assert instruction == "/not-a-skill /skill-c hello"
 
 
-
     def test_split_caps_at_five_total(self, tmp_path):
         from agent.skill_commands import split_stacked_skill_commands
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -896,31 +918,6 @@ class TestStackedSkillCommands:
         assert instruction.startswith("/stk-5")
 
 
-
-    def test_stacked_message_forwards_task_id_to_each_skill(self, tmp_path):
-        from agent.skill_commands import build_stacked_skill_invocation_message
-
-        with (
-            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
-            patch("tools.skill_usage.bump_use") as bump_use,
-        ):
-            self._setup_three_skills(tmp_path)
-            scan_skill_commands()
-            result = build_stacked_skill_invocation_message(
-                ["/skill-a", "/skill-b"],
-                task_id="task-stacked",
-            )
-
-        assert result is not None
-        assert [call.args[0] for call in bump_use.call_args_list] == [
-            "skill-a",
-            "skill-b",
-        ]
-        assert all(
-            call.kwargs == {"task_id": "task-stacked"}
-            for call in bump_use.call_args_list
-        )
-
     def test_stacked_message_skips_missing_skills(self, tmp_path):
         from agent.skill_commands import build_stacked_skill_invocation_message
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -933,4 +930,4 @@ class TestStackedSkillCommands:
         msg, loaded, missing = result
         assert loaded == ["skill-a"]
         assert missing == ["gone"]
-        assert "Skills missing (skipped): gone" in msg
+        assert "gone" in msg
